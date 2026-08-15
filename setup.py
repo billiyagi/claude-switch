@@ -6,12 +6,12 @@ from pathlib import Path
 
 setup(
     name="claude-switch",
-    version="1.0.0",
-    description="CLI tool to manage and switch Claude Code API provider configurations",
+    version="1.1.0",
+    description="CLI tool to manage and switch Claude Code API provider configurations (cross-platform)",
     long_description=Path("README.md").read_text(),
     long_description_content_type="text/markdown",
     author="Billy Febryansyah",
-    url="https://github.com/febrybilliyagi/claude-switch",
+    url="https://github.com/billiyagi/claude-switch",
     py_modules=["claude_switch"],
     python_requires=">=3.8",
     entry_points={
@@ -24,6 +24,7 @@ setup(
         "Environment :: Console",
         "Intended Audience :: Developers",
         "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
         "Topic :: Software Development :: Tools",
     ],

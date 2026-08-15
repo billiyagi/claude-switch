@@ -16,11 +16,14 @@ Usage:
     claude-switch export <name>    Print shell export commands for a profile
     claude-switch init             Create a quick shell alias/function
     claude-switch models [name]    List available models from a profile's endpoint
+    claude-switch which            Show detected claude binary path
 """
 
 import argparse
 import json
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -33,20 +36,125 @@ CONFIG_DIR = Path.home() / ".claude-switch"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
 ACTIVE_FILE = CONFIG_DIR / "active"
 
-# ── Colors ─────────────────────────────────────────────────────────────────
+# ── Platform detection ─────────────────────────────────────────────────────
+IS_WINDOWS = platform.system() == "Windows"
+IS_MACOS = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
+PLATFORM = platform.system()
+
+# ── Colors (disabled on Windows if no ANSI support) ────────────────────────
+def _supports_color():
+    if IS_WINDOWS:
+        # Enable ANSI on Windows 10+
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+            return True
+        except Exception:
+            return os.environ.get("TERM", "") != ""
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+_USE_COLOR = _supports_color()
+
 class C:
-    BOLD  = "\033[1m"
-    DIM   = "\033[2m"
-    GREEN = "\033[32m"
-    CYAN  = "\033[36m"
-    YELLOW= "\033[33m"
-    RED   = "\033[31m"
-    RESET = "\033[0m"
+    BOLD  = "\033[1m" if _USE_COLOR else ""
+    DIM   = "\033[2m" if _USE_COLOR else ""
+    GREEN = "\033[32m" if _USE_COLOR else ""
+    CYAN  = "\033[36m" if _USE_COLOR else ""
+    YELLOW= "\033[33m" if _USE_COLOR else ""
+    RED   = "\033[31m" if _USE_COLOR else ""
+    RESET = "\033[0m" if _USE_COLOR else ""
 
 def ok(msg):   print(f"{C.GREEN}✔{C.RESET} {msg}")
 def info(msg): print(f"{C.CYAN}ℹ{C.RESET} {msg}")
 def warn(msg): print(f"{C.YELLOW}⚠{C.RESET} {msg}")
 def err(msg):  print(f"{C.RED}✘{C.RESET} {msg}", file=sys.stderr)
+
+# ── Cross-platform claude binary detection ─────────────────────────────────
+def find_claude_binary() -> Optional[str]:
+    """Find claude binary across Windows, macOS, and Linux.
+
+    Search order:
+    1. shutil.which('claude') — works on all platforms
+    2. shutil.which('claude.exe') — Windows fallback
+    3. Common install paths per platform
+    """
+    # 1. Standard PATH lookup (cross-platform)
+    found = shutil.which("claude")
+    if found:
+        return found
+
+    # Windows: try .exe explicitly
+    if IS_WINDOWS:
+        found = shutil.which("claude.exe")
+        if found:
+            return found
+
+    # 2. Common install paths
+    common_paths = []
+
+    if IS_WINDOWS:
+        # Windows: npm global, local app data, scoop, chocolatey
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        appdata = os.environ.get("APPDATA", "")
+        user_profile = os.environ.get("USERPROFILE", "")
+        if appdata:
+            common_paths.append(Path(appdata) / "npm" / "claude.cmd")
+            common_paths.append(Path(appdata) / "npm" / "claude.exe")
+        if local_app:
+            common_paths.append(Path(local_app) / "Programs" / "claude" / "claude.exe")
+        if user_profile:
+            common_paths.append(Path(user_profile) / "scoop" / "shims" / "claude.exe")
+        # nvm-windows
+        if appdata:
+            nvm_dir = Path(appdata) / "nvm"
+            if nvm_dir.exists():
+                for d in nvm_dir.iterdir():
+                    if d.is_dir() and d.name.startswith("v"):
+                        common_paths.append(d / "claude.cmd")
+
+    elif IS_MACOS:
+        # macOS: homebrew, nvm, volta, npm global
+        home = Path.home()
+        common_paths.extend([
+            home / ".npm-global" / "bin" / "claude",
+            home / ".volta" / "bin" / "claude",
+            Path("/usr/local/bin/claude"),        # Intel homebrew
+            Path("/opt/homebrew/bin/claude"),      # Apple Silicon homebrew
+            home / ".bun" / "bin" / "claude",
+        ])
+        # nvm
+        nvm_dir = home / ".nvm" / "versions" / "node"
+        if nvm_dir.exists():
+            for d in sorted(nvm_dir.iterdir(), reverse=True):
+                candidate = d / "bin" / "claude"
+                if candidate.exists():
+                    common_paths.append(candidate)
+
+    else:
+        # Linux: nvm, volta, npm global, flatpak
+        home = Path.home()
+        common_paths.extend([
+            home / ".npm-global" / "bin" / "claude",
+            home / ".volta" / "bin" / "claude",
+            home / ".bun" / "bin" / "claude",
+            Path("/usr/local/bin/claude"),
+            Path("/usr/bin/claude"),
+        ])
+        # nvm
+        nvm_dir = home / ".nvm" / "versions" / "node"
+        if nvm_dir.exists():
+            for d in sorted(nvm_dir.iterdir(), reverse=True):
+                candidate = d / "bin" / "claude"
+                if candidate.exists():
+                    common_paths.append(candidate)
+
+    for p in common_paths:
+        if p.exists():
+            return str(p)
+
+    return None
 
 # ── Data helpers ───────────────────────────────────────────────────────────
 def ensure_dir():
@@ -394,10 +502,18 @@ def cmd_export(args):
         sys.exit(1)
 
     env = profile_to_env(profiles[name])
-    for k, v in env.items():
-        # Shell-safe quoting
-        escaped = v.replace("'", "'\\''")
-        print(f"export {k}='{escaped}'")
+
+    if IS_WINDOWS:
+        # PowerShell syntax
+        for k, v in env.items():
+            # Escape single quotes for PowerShell
+            escaped = v.replace("'", "''")
+            print(f"$env:{k} = '{escaped}'")
+    else:
+        # Unix shell syntax
+        for k, v in env.items():
+            escaped = v.replace("'", "'\\''")
+            print(f"export {k}='{escaped}'")
 
 def cmd_remove(args):
     """Remove a profile."""
@@ -483,24 +599,100 @@ def cmd_run(args):
     env = os.environ.copy()
     env.update(profile_to_env(profiles[name]))
 
-    claude_bin = subprocess.run(
-        ["which", "claude"], capture_output=True, text=True
-    ).stdout.strip()
+    claude_bin = find_claude_binary()
     if not claude_bin:
-        err("Claude Code not found in PATH.")
+        err("Claude Code not found in PATH or common install locations.")
+        if IS_WINDOWS:
+            info("Make sure Claude Code is installed and in your PATH.")
+            info("  npm install -g @anthropic-ai/claude-code")
+            info("  Or check: https://docs.anthropic.com/en/docs/claude-code")
+        else:
+            info("Install with: npm install -g @anthropic-ai/claude-code")
         sys.exit(1)
 
     cmd = [claude_bin] + args.claude_args
     info(f"Launching claude with profile '{C.BOLD}{name}{C.RESET}{C.CYAN}'...")
+    info(f"Binary: {claude_bin}")
     result = subprocess.run(cmd, env=env)
     sys.exit(result.returncode)
 
+def cmd_which(args):
+    """Show detected claude binary path and platform info."""
+    print(f"\n{C.BOLD}Platform:{C.RESET} {PLATFORM} ({platform.machine()})")
+    print(f"{C.BOLD}Python:{C.RESET}  {sys.version.split()[0]}")
+
+    claude_bin = find_claude_binary()
+    if claude_bin:
+        print(f"{C.BOLD}Claude:{C.RESET}  {C.GREEN}{claude_bin}{C.RESET}")
+
+        # Try to get version
+        try:
+            ver = subprocess.run(
+                [claude_bin, "--version"],
+                capture_output=True, text=True, timeout=5
+            )
+            if ver.returncode == 0 and ver.stdout.strip():
+                print(f"{C.BOLD}Version:{C.RESET} {ver.stdout.strip()}")
+        except Exception:
+            pass
+    else:
+        print(f"{C.BOLD}Claude:{C.RESET}  {C.RED}not found{C.RESET}")
+        if IS_WINDOWS:
+            info("Install: npm install -g @anthropic-ai/claude-code")
+        else:
+            info("Install: npm install -g @anthropic-ai/claude-code")
+    print()
+
 def cmd_init(args):
     """Print shell function for easy use."""
-    shell = args.shell or os.environ.get("SHELL", "/bin/bash")
-    shell_name = Path(shell).name
+    shell = args.shell or os.environ.get("SHELL", "")
+    if shell:
+        shell_name = Path(shell).name
+    elif IS_WINDOWS:
+        # Detect PowerShell vs cmd
+        shell_name = "powershell"
+    else:
+        shell_name = "bash"
 
-    if shell_name == "fish":
+    if IS_WINDOWS and not args.shell:
+        # Show both PowerShell and CMD options
+        pwsh_func = """# Add to your PowerShell $PROFILE (run: notepad $PROFILE)
+function cc {
+    $profileName = if (Test-Path ~/.claude-switch/active) {
+        Get-Content ~/.claude-switch/active -ErrorAction SilentlyContinue
+    } else { $null }
+
+    if (-not $profileName) {
+        Write-Host "No active profile. Run: claude-switch use <name>" -ForegroundColor Yellow
+        return
+    }
+
+    claude-switch export $profileName | Invoke-Expression
+    claude @args
+}"""
+
+        cmd_func = """@echo off
+REM Add to a .bat file in your PATH (e.g., cc.bat)
+for /f "usebackq delims=" %%i in (`type "%USERPROFILE%\\.claude-switch\\active" 2^>nul`) do set PROFILE=%%i
+if "%PROFILE%"=="" (
+    echo No active profile. Run: claude-switch use ^<name^>
+    exit /b 1
+)
+for /f "usebackq delims=" %%i in (`claude-switch export %PROFILE%`) do %%i
+claude %*"""
+
+        print(f"\n{C.BOLD}Shell functions for Windows:{C.RESET}\n")
+
+        print(f"{C.BOLD}── PowerShell ($PROFILE) ──{C.RESET}\n")
+        print(pwsh_func)
+
+        print(f"\n{C.BOLD}── CMD (save as cc.bat in PATH) ──{C.RESET}\n")
+        print(cmd_func)
+
+        print(f"\n{C.DIM}PowerShell: notepad $PROFILE → paste function → restart shell{C.RESET}")
+        print(f"{C.DIM}CMD: save the script as cc.bat somewhere in your PATH{C.RESET}")
+
+    elif shell_name == "fish":
         func = """# Add to ~/.config/fish/config.fish
 function cc --description "Launch claude with claude-switch profile"
     set -l profile (cat ~/.claude-switch/active 2>/dev/null | string trim)
@@ -510,12 +702,17 @@ function cc --description "Launch claude with claude-switch profile"
     end
 
     set -l tmpfile (mktemp)
-    python3 claude_switch.py export $profile > $tmpfile
+    claude-switch export $profile > $tmpfile
     and source $tmpfile
     and rm $tmpfile
 
     claude $argv
 end"""
+        print(f"\n{C.BOLD}Shell function for fish:{C.RESET}\n")
+        print(func)
+        print(f"\n{C.DIM}After adding, restart your shell or run: source ~/.config/fish/config.fish{C.RESET}")
+        print(f"{C.DIM}Then use: cc (instead of claude) to auto-load your active profile.{C.RESET}\n")
+
     elif shell_name == "zsh":
         func = """# Add to ~/.zshrc
 cc() {
@@ -528,6 +725,11 @@ cc() {
     eval "$(claude-switch export "$profile")"
     claude "$@"
 }"""
+        print(f"\n{C.BOLD}Shell function for zsh:{C.RESET}\n")
+        print(func)
+        print(f"\n{C.DIM}After adding, restart your shell or run: source ~/.zshrc{C.RESET}")
+        print(f"{C.DIM}Then use: cc (instead of claude) to auto-load your active profile.{C.RESET}\n")
+
     else:
         func = """# Add to ~/.bashrc
 cc() {
@@ -540,11 +742,10 @@ cc() {
     eval "$(claude-switch export "$profile")"
     claude "$@"
 }"""
-
-    print(f"\n{C.BOLD}Shell function for {shell_name}:{C.RESET}\n")
-    print(func)
-    print(f"\n{C.DIM}After adding, restart your shell or run: source ~/.{shell_name}rc{C.RESET}")
-    print(f"{C.DIM}Then use: cc (instead of claude) to auto-load your active profile.{C.RESET}\n")
+        print(f"\n{C.BOLD}Shell function for bash:{C.RESET}\n")
+        print(func)
+        print(f"\n{C.DIM}After adding, restart your shell or run: source ~/.bashrc{C.RESET}")
+        print(f"{C.DIM}Then use: cc (instead of claude) to auto-load your active profile.{C.RESET}\n")
 
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
@@ -561,6 +762,7 @@ Examples:
   claude-switch list                 Show all profiles
   claude-switch models               List models from active profile's endpoint
   claude-switch models openrouter    List models from a specific profile
+  claude-switch which                Show detected claude binary
   claude-switch init                 Show shell alias setup
         """,
     )
@@ -608,13 +810,17 @@ Examples:
 
     # init
     p_init = sub.add_parser("init", help="Show shell alias/function setup")
-    p_init.add_argument("--shell", help="Shell type (bash/zsh/fish)")
+    p_init.add_argument("--shell", help="Shell type (bash/zsh/fish/powershell)")
     p_init.set_defaults(func=cmd_init)
 
     # models
     p_models = sub.add_parser("models", help="List available models from profile's endpoint")
     p_models.add_argument("name", nargs="?", help="Profile name (default: active)")
     p_models.set_defaults(func=cmd_models)
+
+    # which
+    p_which = sub.add_parser("which", help="Show detected claude binary path")
+    p_which.set_defaults(func=cmd_which)
 
     args = parser.parse_args()
     if not args.command:
