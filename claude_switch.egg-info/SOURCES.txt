@@ -1,9 +1,0 @@
-LICENSE
-README.md
-claude_switch.py
-setup.py
-claude_switch.egg-info/PKG-INFO
-claude_switch.egg-info/SOURCES.txt
-claude_switch.egg-info/dependency_links.txt
-claude_switch.egg-info/entry_points.txt
-claude_switch.egg-info/top_level.txt

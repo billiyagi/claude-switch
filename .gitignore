@@ -4,3 +4,9 @@ claude-switch/
 ├── README.md
 ├── LICENSE
 └── .gitignore
+
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
