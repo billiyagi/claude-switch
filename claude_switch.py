@@ -16,7 +16,8 @@ Usage:
     claude-switch export <name>    Print shell export commands for a profile
     claude-switch init             Create a quick shell alias/function
     claude-switch models [name]    List available models from a profile's endpoint
-    claude-switch which            Show detected claude binary path
+    claude-switch sync         Sync active profile to ~/.claude/settings.json
+    claude-switch update       Self-update from GitHub
 """
 
 import argparse
@@ -30,6 +31,11 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Optional
+try:
+    from importlib.metadata import version as pkg_version, PackageNotFoundError
+except ImportError:
+    pkg_version = None
+    PackageNotFoundError = Exception
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".claude-switch"
@@ -698,6 +704,79 @@ def cmd_sync(args):
         display = v[:8] + "***" if ("TOKEN" in k or "KEY" in k) and len(v) > 8 else v
         print(f"  {k}={display}")
 
+def cmd_update(args):
+    """Self-update claude-switch from GitHub."""
+    # Current version
+    current = "unknown"
+    try:
+        if pkg_version:
+            current = pkg_version("claude-switch")
+    except (PackageNotFoundError, Exception):
+        # Fallback: read from setup.py or hardcoded
+        current = "dev"
+
+    print(f"\n{C.BOLD}claude-switch updater{C.RESET}")
+    print(f"  Current version: {C.CYAN}{current}{C.RESET}\n")
+
+    # Check if installed via pipx
+    pipx_bin = shutil.which("pipx")
+    if not pipx_bin:
+        err("pipx not found. Install with: brew install pipx / pip install pipx")
+        info("Manual update: pipx install --force git+https://github.com/billiyagi/claude-switch.git")
+        sys.exit(1)
+
+    info("Pulling latest from GitHub...")
+
+    # Method 1: pipx upgrade (works if installed from git)
+    try:
+        result = subprocess.run(
+            [pipx_bin, "upgrade", "claude-switch"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            # Check if actually updated
+            if "already up to date" in result.stdout.lower() or "not upgrading" in result.stdout.lower():
+                ok(f"Already up to date (v{current})")
+            else:
+                # Get new version
+                new_ver = current
+                try:
+                    if pkg_version:
+                        new_ver = pkg_version("claude-switch")
+                except (PackageNotFoundError, Exception):
+                    pass
+                ok(f"Updated! {C.CYAN}{current}{C.RESET} → {C.GREEN}{new_ver}{C.RESET}")
+            return
+    except subprocess.TimeoutExpired:
+        err("Update timed out.")
+        sys.exit(1)
+    except Exception as e:
+        pass  # Fall through to force reinstall
+
+    # Method 2: force reinstall if upgrade fails
+    info("Trying force reinstall...")
+    try:
+        result = subprocess.run(
+            [pipx_bin, "install", "--force", "git+https://github.com/billiyagi/claude-switch.git"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            new_ver = current
+            try:
+                if pkg_version:
+                    new_ver = pkg_version("claude-switch")
+            except (PackageNotFoundError, Exception):
+                pass
+            ok(f"Reinstalled! {C.CYAN}{current}{C.RESET} → {C.GREEN}{new_ver}{C.RESET}")
+        else:
+            err(f"Update failed:\n{result.stderr}")
+            info("Manual: pipx install --force git+https://github.com/billiyagi/claude-switch.git")
+            sys.exit(1)
+    except subprocess.TimeoutExpired:
+        err("Update timed out.")
+        sys.exit(1)
+
+
 def cmd_init(args):
     """Print shell function for easy use."""
     shell = args.shell or os.environ.get("SHELL", "")
@@ -805,6 +884,7 @@ Examples:
   claude-switch which                Show detected claude binary
   claude-switch init                 Show shell alias setup
   claude-switch sync                 Sync active profile to ~/.claude/settings.json
+  claude-switch update               Self-update from GitHub
         """,
     )
 
@@ -866,6 +946,10 @@ Examples:
     # sync
     p_sync = sub.add_parser("sync", help="Sync active profile to ~/.claude/settings.json")
     p_sync.set_defaults(func=cmd_sync)
+
+    # update
+    p_update = sub.add_parser("update", help="Self-update claude-switch from GitHub")
+    p_update.set_defaults(func=cmd_update)
 
     args = parser.parse_args()
     if not args.command:
