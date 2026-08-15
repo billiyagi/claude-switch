@@ -1,0 +1,6 @@
+claude-switch/
+├── claude_switch.py    # Main CLI tool (single file)
+├── setup.py            # pip install support
+├── README.md
+├── LICENSE
+└── .gitignore

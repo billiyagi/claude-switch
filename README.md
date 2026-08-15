@@ -1,0 +1,106 @@
+# claude-switch
+
+CLI tool to manage and switch Claude Code API provider configurations.
+
+Quickly switch between different API providers (OpenRouter, Anthropic direct, custom gateways, etc.) without manually editing environment variables every time.
+
+## Install
+
+```bash
+pip install git+https://github.com/febrybilliyagi/claude-switch.git
+```
+
+Or clone and install locally:
+
+```bash
+git clone https://github.com/febrybilliyagi/claude-switch.git
+cd claude-switch
+pip install -e .
+```
+
+## Usage
+
+### Add a provider profile
+
+```bash
+claude-switch add openrouter
+```
+
+Interactive wizard guides you through:
+- Base URL
+- Auth Token / API Key
+- Model name
+- Small/fast model for background tasks
+
+Built-in templates for: **Anthropic direct**, **OpenRouter**, **OpenAI-compatible** gateways.
+
+### List profiles
+
+```bash
+claude-switch list
+```
+
+### Switch active profile
+
+```bash
+claude-switch use openrouter
+```
+
+### Launch Claude with active profile
+
+```bash
+claude-switch run
+# or pass args:
+claude-switch run -- -c "hello"
+```
+
+### Shell alias (recommended)
+
+Add to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+cc() {
+    local profile
+    profile=$(cat ~/.claude-switch/active 2>/dev/null)
+    if [[ -z "$profile" ]]; then
+        echo "No active profile. Run: claude-switch use <name>"
+        return 1
+    fi
+    eval "$(claude-switch export "$profile")"
+    claude "$@"
+}
+```
+
+Then just use `cc` instead of `claude`.
+
+## How it works
+
+Profiles are stored in `~/.claude-switch/profiles.json`. When you run `claude-switch use <name>`, it saves the active profile name. When you run `claude-switch run`, it sets the appropriate environment variables (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) and launches Claude Code.
+
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `ANTHROPIC_BASE_URL` | API endpoint URL |
+| `ANTHROPIC_AUTH_TOKEN` | Bearer token for custom gateways |
+| `ANTHROPIC_API_KEY` | API key for direct Anthropic |
+| `ANTHROPIC_MODEL` | Main model name |
+| `ANTHROPIC_SMALL_FAST_MODEL` | Background/fast model |
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `claude-switch add <name>` | Add a new profile (interactive) |
+| `claude-switch list` | List all saved profiles |
+| `claude-switch use <name>` | Set active profile |
+| `claude-switch current` | Show active profile |
+| `claude-switch run [-- args]` | Launch claude with active profile |
+| `claude-switch export <name>` | Print shell export commands |
+| `claude-switch edit <name>` | Edit existing profile |
+| `claude-switch remove <name>` | Delete a profile |
+| `claude-switch init` | Show shell function setup |
+
+## License
+
+MIT
