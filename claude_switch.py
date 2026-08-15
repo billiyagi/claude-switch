@@ -35,6 +35,7 @@ from typing import Optional
 CONFIG_DIR = Path.home() / ".claude-switch"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
 ACTIVE_FILE = CONFIG_DIR / "active"
+CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 
 # ── Platform detection ─────────────────────────────────────────────────────
 IS_WINDOWS = platform.system() == "Windows"
@@ -180,6 +181,38 @@ def get_active_name() -> Optional[str]:
 def set_active(name: str):
     ensure_dir()
     ACTIVE_FILE.write_text(name + "\n")
+
+def update_claude_settings(profile: dict):
+    """Sync claude-switch profile env into ~/.claude/settings.json env field.
+
+    This ensures Claude Code picks up the switched provider even when
+    launched directly (not via claude-switch run).
+    Only touches the 'env' key — all other settings.json fields are preserved.
+    """
+    settings = {}
+    if CLAUDE_SETTINGS_FILE.exists():
+        try:
+            settings = json.loads(CLAUDE_SETTINGS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            settings = {}
+
+    # Build new env from profile
+    new_env = profile_to_env(profile)
+
+    # Merge: keep non-Claude env vars that user may have set manually
+    existing_env = settings.get("env", {})
+    # Remove old claude-switch managed keys first
+    MANAGED_KEYS = {
+        "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    }
+    cleaned = {k: v for k, v in existing_env.items() if k not in MANAGED_KEYS}
+    cleaned.update(new_env)
+    settings["env"] = cleaned
+
+    CLAUDE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_SETTINGS_FILE.write_text(json.dumps(settings, indent=2) + "\n")
 
 def get_active_profile() -> Optional[dict]:
     name = get_active_name()
@@ -459,6 +492,7 @@ def cmd_use(args):
     set_active(name)
     p = profiles[name]
     env = profile_to_env(p)
+    update_claude_settings(p)
 
     ok(f"Switched to '{name}'")
     print(f"\n  {C.BOLD}Environment:{C.RESET}")
@@ -582,6 +616,9 @@ def cmd_edit(args):
 
     profiles[name] = p
     save_profiles(profiles)
+    # If editing the active profile, also sync settings.json
+    if get_active_name() == name:
+        update_claude_settings(p)
     ok(f"Profile '{name}' updated.")
 
 def cmd_run(args):
@@ -598,6 +635,7 @@ def cmd_run(args):
 
     env = os.environ.copy()
     env.update(profile_to_env(profiles[name]))
+    update_claude_settings(profiles[name])
 
     claude_bin = find_claude_binary()
     if not claude_bin:
@@ -642,6 +680,23 @@ def cmd_which(args):
         else:
             info("Install: npm install -g @anthropic-ai/claude-code")
     print()
+
+def cmd_sync(args):
+    """Manually sync active profile env into ~/.claude/settings.json."""
+    name = get_active_name()
+    if not name:
+        err("No active profile. Run: claude-switch use <name>")
+        sys.exit(1)
+    profiles = load_profiles()
+    if name not in profiles:
+        err(f"Active profile '{name}' no longer exists.")
+        sys.exit(1)
+    update_claude_settings(profiles[name])
+    ok(f"Synced '{name}' → {CLAUDE_SETTINGS_FILE}")
+    env = profile_to_env(profiles[name])
+    for k, v in env.items():
+        display = v[:8] + "***" if ("TOKEN" in k or "KEY" in k) and len(v) > 8 else v
+        print(f"  {k}={display}")
 
 def cmd_init(args):
     """Print shell function for easy use."""
@@ -713,38 +768,23 @@ end"""
         print(f"\n{C.DIM}After adding, restart your shell or run: source ~/.config/fish/config.fish{C.RESET}")
         print(f"{C.DIM}Then use: cc (instead of claude) to auto-load your active profile.{C.RESET}\n")
 
-    elif shell_name == "zsh":
-        func = """# Add to ~/.zshrc
-cc() {
+    elif shell_name in ("zsh", "bash"):
+        func = f"""# Add to ~/.{'zshrc' if shell_name == 'zsh' else 'bashrc'}
+cc() {{
     local profile
     profile=$(cat ~/.claude-switch/active 2>/dev/null)
     if [[ -z "$profile" ]]; then
         echo "No active profile. Run: claude-switch use <name>"
         return 1
     fi
+    claude-switch use "$profile" >/dev/null 2>&1
     eval "$(claude-switch export "$profile")"
     claude "$@"
-}"""
-        print(f"\n{C.BOLD}Shell function for zsh:{C.RESET}\n")
+}}"""
+        print(f"\n{C.BOLD}Shell function for {shell_name}:{C.RESET}\n")
         print(func)
-        print(f"\n{C.DIM}After adding, restart your shell or run: source ~/.zshrc{C.RESET}")
-        print(f"{C.DIM}Then use: cc (instead of claude) to auto-load your active profile.{C.RESET}\n")
-
-    else:
-        func = """# Add to ~/.bashrc
-cc() {
-    local profile
-    profile=$(cat ~/.claude-switch/active 2>/dev/null)
-    if [[ -z "$profile" ]]; then
-        echo "No active profile. Run: claude-switch use <name>"
-        return 1
-    fi
-    eval "$(claude-switch export "$profile")"
-    claude "$@"
-}"""
-        print(f"\n{C.BOLD}Shell function for bash:{C.RESET}\n")
-        print(func)
-        print(f"\n{C.DIM}After adding, restart your shell or run: source ~/.bashrc{C.RESET}")
+        rcfile = "~/.zshrc" if shell_name == "zsh" else "~/.bashrc"
+        print(f"\n{C.DIM}After adding, restart your shell or run: source {rcfile}{C.RESET}")
         print(f"{C.DIM}Then use: cc (instead of claude) to auto-load your active profile.{C.RESET}\n")
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -764,6 +804,7 @@ Examples:
   claude-switch models openrouter    List models from a specific profile
   claude-switch which                Show detected claude binary
   claude-switch init                 Show shell alias setup
+  claude-switch sync                 Sync active profile to ~/.claude/settings.json
         """,
     )
 
@@ -821,6 +862,10 @@ Examples:
     # which
     p_which = sub.add_parser("which", help="Show detected claude binary path")
     p_which.set_defaults(func=cmd_which)
+
+    # sync
+    p_sync = sub.add_parser("sync", help="Sync active profile to ~/.claude/settings.json")
+    p_sync.set_defaults(func=cmd_sync)
 
     args = parser.parse_args()
     if not args.command:
