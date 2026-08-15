@@ -1,0 +1,2 @@
+[console_scripts]
+claude-switch = claude_switch:main

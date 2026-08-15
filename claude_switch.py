@@ -15,6 +15,7 @@ Usage:
     claude-switch run [args...]    Launch claude with active profile env
     claude-switch export <name>    Print shell export commands for a profile
     claude-switch init             Create a quick shell alias/function
+    claude-switch models [name]    List available models from a profile's endpoint
 """
 
 import argparse
@@ -22,6 +23,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Optional
 
@@ -105,6 +108,123 @@ PROVIDER_TEMPLATES = {
     },
 }
 
+# ── Model discovery ────────────────────────────────────────────────────────
+def fetch_models(base_url: str, api_key: str = "", auth_token: str = "") -> list[str]:
+    """Fetch available models from an OpenAI-compatible /models endpoint."""
+    url = base_url.rstrip("/") + "/models"
+
+    headers = {"Content-Type": "application/json"}
+    token = auth_token or api_key
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {e.reason}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Connection failed: {e.reason}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+    # Handle both OpenAI format {"data": [{"id": ...}]} and plain list
+    if isinstance(data, dict):
+        items = data.get("data", data.get("models", []))
+    elif isinstance(data, list):
+        items = data
+    else:
+        return []
+
+    models = []
+    for item in items:
+        if isinstance(item, str):
+            models.append(item)
+        elif isinstance(item, dict):
+            mid = item.get("id", "")
+            if mid:
+                models.append(mid)
+
+    return sorted(models)
+
+
+def pick_model(models: list[str], label: str = "model", current: str = "") -> str:
+    """Interactive model picker. Returns selected model ID."""
+    if not models:
+        warn("No models found from endpoint.")
+        return ""
+
+    print(f"\n{C.BOLD}Available models:{C.RESET}\n")
+    for i, m in enumerate(models, 1):
+        marker = f" {C.GREEN}(current){C.RESET}" if m == current else ""
+        print(f"  {C.CYAN}{i:>3}{C.RESET}) {m}{marker}")
+
+    print(f"\n  {C.DIM}Enter number, model name, or press Enter to keep '{current or 'manual'}'{C.RESET}")
+
+    while True:
+        choice = input(f"  Select {label}: ").strip()
+        if not choice:
+            return current
+        # Direct model name
+        if choice in models:
+            return choice
+        # Number selection
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(models):
+                return models[idx]
+        except ValueError:
+            pass
+        # Accept freeform input (user might type a model not in list)
+        warn(f"'{choice}' not in discovered list. Use anyway? (y/N)")
+        confirm = input("  ").strip().lower()
+        if confirm in ("y", "yes"):
+            return choice
+
+
+def cmd_models(args):
+    """List available models from a profile's endpoint."""
+    profiles = load_profiles()
+    name = args.name or get_active_name()
+
+    if not name or name not in profiles:
+        if name:
+            err(f"Profile '{name}' not found.")
+        else:
+            err("No active profile. Specify a profile name or run: claude-switch use <name>")
+        sys.exit(1)
+
+    p = profiles[name]
+    base_url = p.get("base_url", "")
+    if not base_url:
+        err("This profile has no base_url (direct Anthropic). Models endpoint not available.")
+        sys.exit(1)
+
+    info(f"Fetching models from {base_url}/models ...")
+    try:
+        models = fetch_models(base_url, p.get("api_key", ""), p.get("auth_token", ""))
+    except RuntimeError as e:
+        err(f"Failed to fetch models: {e}")
+        sys.exit(1)
+
+    if not models:
+        warn("No models returned by this endpoint.")
+        return
+
+    print(f"\n{C.BOLD}Models for '{name}' ({len(models)} available):{C.RESET}\n")
+    current_model = p.get("model", "")
+    current_small = p.get("small_fast_model", "")
+    for m in models:
+        tags = []
+        if m == current_model:
+            tags.append(f"{C.GREEN}primary{C.RESET}")
+        if m == current_small:
+            tags.append(f"{C.CYAN}small/fast{C.RESET}")
+        tag_str = f"  ← {', '.join(tags)}" if tags else ""
+        print(f"  • {m}{tag_str}")
+    print()
+
 # ── Profile env builder ────────────────────────────────────────────────────
 def profile_to_env(profile: dict) -> dict:
     """Convert a profile dict to env var dict (only non-empty values)."""
@@ -153,9 +273,32 @@ def cmd_add(args):
     base_url = ask("base_url", "Base URL", template.get("base_url", ""))
     auth_token = ask("auth_token", "Auth Token (for custom gateway)", template.get("auth_token", ""), secret=True)
     api_key = ask("api_key", "API Key (for direct Anthropic)", template.get("api_key", ""), secret=True)
-    model = ask("model", "Model", template.get("model", "claude-sonnet-4-20250514"))
-    small_fast_model = ask("small_fast_model", "Small/fast model", template.get("small_fast_model", "claude-haiku-4-20250414"))
     description = ask("description", "Description", template.get("description", name))
+
+    # Auto-discover models from endpoint
+    model = template.get("model", "claude-sonnet-4-20250514")
+    small_fast_model = template.get("small_fast_model", "claude-haiku-4-20250414")
+
+    if base_url:
+        info(f"Fetching available models from {base_url}/models ...")
+        try:
+            discovered = fetch_models(base_url, api_key, auth_token)
+            if discovered:
+                ok(f"Found {len(discovered)} models!")
+                model = pick_model(discovered, "primary model", model)
+                small_fast_model = pick_model(discovered, "small/fast model", small_fast_model)
+            else:
+                warn("No models discovered. Falling back to manual input.")
+                model = ask("model", "Model", model)
+                small_fast_model = ask("small_fast_model", "Small/fast model", small_fast_model)
+        except RuntimeError as e:
+            warn(f"Could not fetch models: {e}")
+            warn("Falling back to manual input.")
+            model = ask("model", "Model", model)
+            small_fast_model = ask("small_fast_model", "Small/fast model", small_fast_model)
+    else:
+        model = ask("model", "Model", model)
+        small_fast_model = ask("small_fast_model", "Small/fast model", small_fast_model)
 
     profile = {
         "description": description,
@@ -292,9 +435,34 @@ def cmd_edit(args):
     p["base_url"] = ask("base_url", "Base URL", p.get("base_url", ""))
     p["auth_token"] = ask("auth_token", "Auth Token", p.get("auth_token", ""))
     p["api_key"] = ask("api_key", "API Key", p.get("api_key", ""))
-    p["model"] = ask("model", "Model", p.get("model", ""))
-    p["small_fast_model"] = ask("small_fast_model", "Small/fast model", p.get("small_fast_model", ""))
     p["description"] = ask("description", "Description", p.get("description", ""))
+
+    # Offer model discovery if base_url is set
+    base_url = p.get("base_url", "")
+    if base_url:
+        fetch_choice = input(f"  Fetch available models from endpoint? [Y/n]: ").strip().lower()
+        if fetch_choice in ("", "y", "yes"):
+            info(f"Fetching models from {base_url}/models ...")
+            try:
+                discovered = fetch_models(base_url, p.get("api_key", ""), p.get("auth_token", ""))
+                if discovered:
+                    ok(f"Found {len(discovered)} models!")
+                    p["model"] = pick_model(discovered, "primary model", p.get("model", ""))
+                    p["small_fast_model"] = pick_model(discovered, "small/fast model", p.get("small_fast_model", ""))
+                else:
+                    warn("No models discovered.")
+                    p["model"] = ask("model", "Model", p.get("model", ""))
+                    p["small_fast_model"] = ask("small_fast_model", "Small/fast model", p.get("small_fast_model", ""))
+            except RuntimeError as e:
+                warn(f"Could not fetch models: {e}")
+                p["model"] = ask("model", "Model", p.get("model", ""))
+                p["small_fast_model"] = ask("small_fast_model", "Small/fast model", p.get("small_fast_model", ""))
+        else:
+            p["model"] = ask("model", "Model", p.get("model", ""))
+            p["small_fast_model"] = ask("small_fast_model", "Small/fast model", p.get("small_fast_model", ""))
+    else:
+        p["model"] = ask("model", "Model", p.get("model", ""))
+        p["small_fast_model"] = ask("small_fast_model", "Small/fast model", p.get("small_fast_model", ""))
 
     profiles[name] = p
     save_profiles(profiles)
@@ -391,6 +559,8 @@ Examples:
   claude-switch run                  Launch claude with active profile
   claude-switch run -- -c "hello"    Pass args to claude
   claude-switch list                 Show all profiles
+  claude-switch models               List models from active profile's endpoint
+  claude-switch models openrouter    List models from a specific profile
   claude-switch init                 Show shell alias setup
         """,
     )
@@ -440,6 +610,11 @@ Examples:
     p_init = sub.add_parser("init", help="Show shell alias/function setup")
     p_init.add_argument("--shell", help="Shell type (bash/zsh/fish)")
     p_init.set_defaults(func=cmd_init)
+
+    # models
+    p_models = sub.add_parser("models", help="List available models from profile's endpoint")
+    p_models.add_argument("name", nargs="?", help="Profile name (default: active)")
+    p_models.set_defaults(func=cmd_models)
 
     args = parser.parse_args()
     if not args.command:
